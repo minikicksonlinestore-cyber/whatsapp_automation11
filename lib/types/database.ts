@@ -1,0 +1,72 @@
+export type Json =
+  | string
+  | number
+  | boolean
+  | null
+  | { [key: string]: Json | undefined }
+  | Json[];
+
+export type TaskStatus = 'pending' | 'processing' | 'sent' | 'failed' | 'cancelled';
+export type PdfProcessingStatus = 'pending' | 'processing' | 'processed' | 'failed';
+
+export interface PdfFile {
+  id: string;
+  filename: string;
+  storage_path: string;
+  file_size?: number | null;
+  processing_status: PdfProcessingStatus;
+  error_message?: string | null;
+  created_at: string;
+}
+
+export interface Task {
+  id: string;
+  pdf_id?: string | null;
+  task_name: string;
+  task_date: string; // YYYY-MM-DD
+  reminder_date: string; // YYYY-MM-DD
+  reminder_time: string; // HH:mm:ss
+  recipient_phone: string;
+  status: TaskStatus;
+  whatsapp_message_id?: string | null;
+  sent_at?: string | null;
+  error_message?: string | null;
+  created_at: string;
+  updated_at: string;
+  pdf_file?: PdfFile | null;
+}
+
+export interface WhatsAppLog {
+  id: string;
+  task_id?: string | null;
+  recipient_phone: string;
+  message_type: string;
+  whatsapp_message_id?: string | null;
+  status: 'success' | 'failed';
+  response?: Json | null;
+  error?: string | null;
+  created_at: string;
+}
+
+export interface Settings {
+  id: string;
+  business_phone: string;
+  recipient_phone: string;
+  reminder_time: string;
+  timezone: string;
+  whatsapp_template_name: string;
+  message_template: string;
+  updated_at: string;
+}
+
+export interface ExtractedTask {
+  id?: string;
+  task_name: string;
+  task_date: string; // YYYY-MM-DD
+  reminder_date?: string; // YYYY-MM-DD
+  reminder_time?: string; // HH:mm:ss
+  recipient_phone?: string;
+  month: number;
+  year: number;
+  approved?: boolean;
+}
