@@ -64,8 +64,8 @@ export async function initAndCommit() {
     dir,
     message: 'feat: initial commit for WhatsApp PDF Reminder Automation application',
     author: {
-      name: 'AutoRemind Bot',
-      email: 'bot@autoremind.local',
+      name: 'muhammed anas',
+      email: 'minikicksonlinestore@gmail.com',
     },
   });
 
