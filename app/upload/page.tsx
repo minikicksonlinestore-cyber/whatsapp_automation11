@@ -100,11 +100,12 @@ export default function UploadPage() {
       const data = await res.json();
 
       if (!res.ok || !data.success) {
-        throw new Error(data.error || 'Failed to extract tasks from PDF.');
+        throw new Error(data?.error || 'Failed to extract tasks from PDF.');
       }
 
+      setErrorMessage(null);
       setPdfId(data.pdfId || null);
-      setExtractedTasks(data.tasks.map((t: ExtractedTask, index: number) => ({
+      setExtractedTasks((data.tasks || []).map((t: ExtractedTask, index: number) => ({
         ...t,
         id: `extracted-${index}-${Date.now()}`,
         approved: true,
@@ -113,13 +114,14 @@ export default function UploadPage() {
       setDetectedSummary({
         month: data.detectedMonth,
         year: data.detectedYear,
-        count: data.tasks.length,
+        count: (data.tasks || []).length,
       });
 
-      setSuccessMessage(`Successfully extracted ${data.tasks.length} tasks from ${file.name}.`);
+      setSuccessMessage(`Successfully extracted ${(data.tasks || []).length} tasks from ${file.name}.`);
     } catch (err: any) {
       console.error('Extraction error:', err);
-      setErrorMessage(err.message || 'Error parsing PDF calendar.');
+      setSuccessMessage(null);
+      setErrorMessage(err?.message || 'Error parsing PDF calendar.');
     } finally {
       setIsExtracting(false);
     }

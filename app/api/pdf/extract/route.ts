@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { extractTasksFromPdf } from '@/lib/pdf/extractor';
-import { supabaseAdmin } from '@/lib/supabase/admin';
+
+export const dynamic = 'force-dynamic';
+export const maxDuration = 30;
 
 export async function POST(req: NextRequest) {
   try {
@@ -22,27 +24,6 @@ export async function POST(req: NextRequest) {
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
-    // Save record to pdf_files table if Supabase is connected
-    let pdfRecordId: string | null = null;
-    try {
-      const { data: pdfRecord } = await supabaseAdmin
-        .from('pdf_files')
-        .insert({
-          filename: file.name,
-          storage_path: `uploads/${Date.now()}_${file.name}`,
-          file_size: file.size,
-          processing_status: 'processing',
-        })
-        .select()
-        .single();
-
-      if (pdfRecord) {
-        pdfRecordId = pdfRecord.id;
-      }
-    } catch (dbErr) {
-      console.warn('Supabase DB notice during pdf_files insert:', dbErr);
-    }
-
     const extractionResult = await extractTasksFromPdf(buffer, {
       defaultYear,
       defaultMonth,
@@ -50,22 +31,8 @@ export async function POST(req: NextRequest) {
       defaultReminderTime,
     });
 
-    if (pdfRecordId) {
-      try {
-        await supabaseAdmin
-          .from('pdf_files')
-          .update({
-            processing_status: 'processed',
-          })
-          .eq('id', pdfRecordId);
-      } catch (err) {
-        console.warn('Supabase status update notice:', err);
-      }
-    }
-
     return NextResponse.json({
       success: true,
-      pdfId: pdfRecordId,
       filename: file.name,
       tasks: extractionResult.tasks,
       detectedMonth: extractionResult.detectedMonth,
