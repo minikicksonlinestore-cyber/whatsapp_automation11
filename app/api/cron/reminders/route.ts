@@ -1,61 +1,48 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { supabaseAdmin } from '@/lib/supabase/admin';
-import { sendWhatsAppReminder } from '@/lib/whatsapp';
-import { getNowInTimezone, formatReadableDate } from '@/lib/date/calculator';
+import { getTasksFromStore, updateTaskStatus, logWhatsAppMessage } from '@/lib/storage/store';
+import { sendBaileysGroupReminder, sendBaileysIndividual, formatGroupDateLabel, buildGroupMessageText, getBaileysStatus } from '@/lib/whatsapp-baileys';
+import { getNowInTimezone } from '@/lib/date/calculator';
 import { env } from '@/lib/validation/env';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 60; // Allow up to 60s for Vercel Cron function execution
+export const maxDuration = 60;
 
 export async function GET(req: NextRequest) {
   const authHeader = req.headers.get('authorization');
   const cronSecretQuery = req.nextUrl.searchParams.get('secret');
 
-  // Verify CRON_SECRET if configured
   if (env.CRON_SECRET) {
     const isAuthorizedHeader = authHeader === `Bearer ${env.CRON_SECRET}`;
     const isAuthorizedQuery = cronSecretQuery === env.CRON_SECRET;
-
     if (!isAuthorizedHeader && !isAuthorizedQuery) {
-      return NextResponse.json(
-        { error: 'Unauthorized: Invalid or missing CRON_SECRET authorization.' },
-        { status: 401 }
-      );
+      return NextResponse.json({ error: 'Unauthorized: Invalid or missing CRON_SECRET authorization.' }, { status: 401 });
     }
   }
 
   try {
-    // 1. Fetch configured timezone and settings
-    const { data: settings } = await supabaseAdmin
-      .from('settings')
-      .select('*')
-      .limit(1)
-      .maybeSingle();
-
-    const timezone = settings?.timezone || 'Asia/Kolkata';
-    const templateName = settings?.whatsapp_template_name || env.WHATSAPP_TEMPLATE_NAME || 'task_reminder';
-
-    // 2. Get current time in the configured timezone (e.g. Asia/Kolkata)
+    const timezone = process.env.TIMEZONE || 'Asia/Kolkata';
     const { currentDate, currentTime, formattedDisplay } = getNowInTimezone(timezone);
 
-    console.log(`[Cron Reminders] Executing at ${formattedDisplay} (Timezone: ${timezone})`);
+    console.log(`[Cron Reminders] Executing at ${formattedDisplay} (${timezone})`);
 
-    // 3. Find pending tasks where reminder_date <= currentDate AND reminder_time <= currentTime
-    const { data: dueTasks, error: queryError } = await supabaseAdmin
-      .from('tasks')
-      .select('*')
-      .in('status', ['pending'])
-      .lte('reminder_date', currentDate)
-      .lte('reminder_time', currentTime)
-      .order('reminder_date', { ascending: true })
-      .limit(50); // Process in batches of 50
-
-    if (queryError) {
-      console.error('[Cron Reminders] DB Query error:', queryError);
-      return NextResponse.json({ error: queryError.message }, { status: 500 });
+    // ── 1. Check Baileys gateway status ─────────────────────────────────────
+    const gatewayStatus = await getBaileysStatus();
+    if (!gatewayStatus.connected) {
+      const msg = `Baileys gateway not connected. ${gatewayStatus.error || 'Start: node baileys/gateway.mjs'}`;
+      console.error('[Cron Reminders]', msg);
+      return NextResponse.json({ error: msg, evaluatedAt: formattedDisplay }, { status: 503 });
     }
 
-    if (!dueTasks || dueTasks.length === 0) {
+    console.log(`[Cron Reminders] Gateway connected as ${gatewayStatus.phone}`);
+
+    // ── 2. Fetch pending tasks due now ───────────────────────────────────────
+    const { tasks: allPending } = await getTasksFromStore({ status: 'pending' });
+
+    const dueTasks = allPending.filter(t =>
+      t.reminder_date <= currentDate && t.reminder_time <= currentTime
+    );
+
+    if (dueTasks.length === 0) {
       return NextResponse.json({
         success: true,
         message: 'No reminders due at this time.',
@@ -66,91 +53,80 @@ export async function GET(req: NextRequest) {
       });
     }
 
-    console.log(`[Cron Reminders] Found ${dueTasks.length} task(s) due for reminders.`);
+    console.log(`[Cron Reminders] Found ${dueTasks.length} task(s) due.`);
 
-    const results = [];
-
+    // ── 3. Group tasks by reminder_date ──────────────────────────────────────
+    //  Format: { "2026-08-19": [ task, task, ... ] }
+    const byDate: Record<string, typeof dueTasks> = {};
     for (const task of dueTasks) {
-      // 4. Atomic Lock / Claim: update status to 'processing' only if it's still 'pending'
-      const { data: lockedTask, error: lockError } = await supabaseAdmin
-        .from('tasks')
-        .update({
-          status: 'processing',
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', task.id)
-        .eq('status', 'pending')
-        .select()
-        .single();
+      const key = task.reminder_date || task.task_date;
+      if (!byDate[key]) byDate[key] = [];
+      byDate[key].push(task);
+    }
 
-      if (lockError || !lockedTask) {
-        console.warn(`[Cron Reminders] Task ${task.id} could not be locked or already claimed.`);
-        continue;
-      }
+    // ── 4. Resolve group ID ──────────────────────────────────────────────────
+    const groupId = process.env.WHATSAPP_GROUP_ID || '';
 
-      // 5. Format parameters & Send WhatsApp reminder via official Meta Cloud API
-      const taskDateFormatted = formatReadableDate(task.task_date);
-      const recipient = task.recipient_phone || settings?.recipient_phone || '+917025219962';
+    const results: any[] = [];
 
-      const sendResult = await sendWhatsAppReminder({
-        to: recipient,
-        templateName,
-        taskDateFormatted,
-        taskName: task.task_name,
+    // ── 5. Send grouped messages, one per date ───────────────────────────────
+    for (const [taskDate, tasks] of Object.entries(byDate)) {
+      const dateLabel = formatGroupDateLabel(taskDate);
+
+      // Build items from task_name — expected format: "ClientName – TaskName"
+      // If task_name has " – " separator use it; otherwise use task_name as-is
+      const items = tasks.map(t => {
+        const sep = t.task_name.includes(' – ') ? ' – ' : (t.task_name.includes(' - ') ? ' - ' : null);
+        if (sep) {
+          const [client, ...rest] = t.task_name.split(sep);
+          return { client: client.trim(), task: rest.join(sep).trim() };
+        }
+        return { client: 'Task', task: t.task_name.trim() };
       });
 
-      // 6. Record metadata in whatsapp_logs
-      try {
-        await supabaseAdmin.from('whatsapp_logs').insert({
-          task_id: task.id,
-          recipient_phone: recipient,
-          message_type: 'template',
-          whatsapp_message_id: sendResult.messageId || null,
-          status: sendResult.success ? 'success' : 'failed',
-          response: sendResult.rawResponse || null,
-          error: sendResult.error || null,
-        });
-      } catch (logErr) {
-        console.error('[Cron Reminders] Error inserting into whatsapp_logs:', logErr);
+      let sendResult: { success: boolean; messageId?: string; error?: string };
+
+      if (groupId) {
+        // ── Send to group ────────────────────────────────────────────────────
+        console.log(`[Cron Reminders] Sending group message for ${dateLabel} → ${groupId}`);
+        sendResult = await sendBaileysGroupReminder({ groupId, dateLabel, items });
+      } else {
+        // ── Fallback: send individual messages to each task's recipient ──────
+        console.warn('[Cron Reminders] WHATSAPP_GROUP_ID not set — falling back to individual messages.');
+        const message = buildGroupMessageText(dateLabel, items);
+        const recipient = tasks[0]?.recipient_phone || '+917025219962';
+        sendResult = await sendBaileysIndividual({ phone: recipient, message });
       }
 
-      // 7. Update task status based on verified Meta API result
-      if (sendResult.success && sendResult.messageId) {
-        await supabaseAdmin
-          .from('tasks')
-          .update({
-            status: 'sent',
+      // ── 6. Update all tasks in this date group ───────────────────────────
+      for (const task of tasks) {
+        if (sendResult.success) {
+          await updateTaskStatus(task.id, 'sent', {
             whatsapp_message_id: sendResult.messageId,
             sent_at: new Date().toISOString(),
-            error_message: null,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', task.id);
+          });
+        } else {
+          await updateTaskStatus(task.id, 'failed', {
+            error_message: sendResult.error || 'Send failed',
+          });
+        }
+
+        await logWhatsAppMessage({
+          task_id: task.id,
+          recipient_phone: groupId || task.recipient_phone,
+          message_type: groupId ? 'group' : 'individual',
+          whatsapp_message_id: sendResult.messageId || null,
+          status: sendResult.success ? 'success' : 'failed',
+          error: sendResult.error || null,
+        } as any);
 
         results.push({
           taskId: task.id,
           taskName: task.task_name,
           taskDate: task.task_date,
-          recipient,
-          status: 'sent',
+          dateLabel,
+          status: sendResult.success ? 'sent' : 'failed',
           messageId: sendResult.messageId,
-        });
-      } else {
-        await supabaseAdmin
-          .from('tasks')
-          .update({
-            status: 'failed',
-            error_message: sendResult.error || 'Meta API delivery submission failed',
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', task.id);
-
-        results.push({
-          taskId: task.id,
-          taskName: task.task_name,
-          taskDate: task.task_date,
-          recipient,
-          status: 'failed',
           error: sendResult.error,
         });
       }
@@ -164,6 +140,7 @@ export async function GET(req: NextRequest) {
       processedCount: results.length,
       sentCount: results.filter(r => r.status === 'sent').length,
       failedCount: results.filter(r => r.status === 'failed').length,
+      groupId: groupId || null,
       results,
     });
   } catch (err: any) {
