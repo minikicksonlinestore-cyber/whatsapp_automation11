@@ -10,6 +10,22 @@ export interface SendWhatsAppTemplateParams {
   taskName: string; // e.g. "Motion graphics"
 }
 
+export interface SendGroupReminderParams {
+  /**
+   * WhatsApp group chat ID — format: "<number>-<timestamp>@g.us"
+   * OR an individual phone number for fallback.
+   */
+  groupId: string;
+  /**
+   * The date label, e.g. "19 Aug (Tomorrow)"
+   */
+  dateLabel: string;
+  /**
+   * Array of { client, task } pairs, e.g. [{ client: "Carzo", task: "Scripted 2" }]
+   */
+  items: Array<{ client: string; task: string }>;
+}
+
 export interface WhatsAppSendResult {
   success: boolean;
   messageId?: string;
@@ -18,29 +34,17 @@ export interface WhatsAppSendResult {
 }
 
 /**
- * Validates and sends a pre-approved WhatsApp template message via official Meta WhatsApp Cloud API.
- * 
- * Template:
- * 🔔 Task Reminder
- * Tomorrow ({{1}}) you have:
- * 📌 {{2}}
- * Please complete the task on time.
+ * Sends a pre-approved WhatsApp template message (individual) via Meta Cloud API.
  */
 export async function sendWhatsAppReminder(params: SendWhatsAppTemplateParams): Promise<WhatsAppSendResult> {
   const configValidation = validateWhatsAppConfig();
   if (!configValidation.isValid) {
-    return {
-      success: false,
-      error: `WhatsApp configuration error: ${configValidation.error}`,
-    };
+    return { success: false, error: `WhatsApp configuration error: ${configValidation.error}` };
   }
 
   const recipientClean = formatPhoneForWhatsApp(params.to);
   if (!recipientClean || recipientClean.length < 10) {
-    return {
-      success: false,
-      error: `Invalid recipient phone number: ${params.to}`,
-    };
+    return { success: false, error: `Invalid recipient phone number: ${params.to}` };
   }
 
   const templateName = params.templateName || env.WHATSAPP_TEMPLATE_NAME || 'task_reminder';
@@ -58,32 +62,77 @@ export async function sendWhatsAppReminder(params: SendWhatsAppTemplateParams): 
     type: 'template',
     template: {
       name: templateName,
-      language: {
-        code: languageCode,
-      },
+      language: { code: languageCode },
       components: [
         {
           type: 'body',
           parameters: [
-            {
-              type: 'text',
-              text: params.taskDateFormatted,
-            },
-            {
-              type: 'text',
-              text: params.taskName,
-            },
+            { type: 'text', text: params.taskDateFormatted },
+            { type: 'text', text: params.taskName },
           ],
         },
       ],
     },
   };
 
+  return _callMetaAPI(url, accessToken, payload);
+}
+
+/**
+ * Sends a grouped reminder message to a WhatsApp group chat.
+ *
+ * Message format:
+ * ─────────────────────
+ * 19 Aug (Tomorrow)
+ *
+ * Carzo – Scripted 2
+ * Disxeno – Reel 4
+ * ─────────────────────
+ *
+ * Uses the Meta Cloud API "text" message type — no template approval needed
+ * for group messages sent through official API (groups require Flows/text).
+ *
+ * NOTE: The WhatsApp Business API currently supports sending to groups only
+ * via the Cloud API using the group's chat ID in the "to" field.
+ */
+export async function sendGroupReminder(params: SendGroupReminderParams): Promise<WhatsAppSendResult> {
+  const configValidation = validateWhatsAppConfig();
+  if (!configValidation.isValid) {
+    return { success: false, error: `WhatsApp configuration error: ${configValidation.error}` };
+  }
+
+  const apiVersion = env.WHATSAPP_API_VERSION || 'v20.0';
+  const phoneNumberId = env.WHATSAPP_PHONE_NUMBER_ID;
+  const accessToken = env.WHATSAPP_ACCESS_TOKEN;
+
+  const url = `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`;
+
+  // Build the message body
+  const taskLines = params.items.map(i => `${i.client} – ${i.task}`).join('\n');
+  const messageText = `${params.dateLabel}\n\n${taskLines}`;
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: params.groupId,          // group ID or individual number
+    type: 'text',
+    text: {
+      preview_url: false,
+      body: messageText,
+    },
+  };
+
+  return _callMetaAPI(url, accessToken, payload);
+}
+
+/**
+ * Shared helper that calls the Meta Graph API and returns a standardised result.
+ */
+async function _callMetaAPI(url: string, accessToken: string, payload: object): Promise<WhatsAppSendResult> {
   try {
     const response = await fetch(url, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${accessToken}`,
+        Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(payload),
@@ -99,19 +148,8 @@ export async function sendWhatsAppReminder(params: SendWhatsAppTemplateParams): 
           }`
         : `Meta API HTTP ${response.status}: ${JSON.stringify(data)}`;
 
-      // Log sanitized error (without access token)
-      console.error('[WhatsApp Service Error]', {
-        status: response.status,
-        recipient: recipientClean,
-        template: templateName,
-        errorMessage,
-      });
-
-      return {
-        success: false,
-        error: errorMessage,
-        rawResponse: data,
-      };
+      console.error('[WhatsApp Service Error]', { status: response.status, errorMessage });
+      return { success: false, error: errorMessage, rawResponse: data };
     }
 
     const messageId = data?.messages?.[0]?.id;
@@ -123,18 +161,11 @@ export async function sendWhatsAppReminder(params: SendWhatsAppTemplateParams): 
       };
     }
 
-    return {
-      success: true,
-      messageId,
-      rawResponse: data,
-    };
+    return { success: true, messageId, rawResponse: data };
   } catch (err: any) {
     const errorString = err?.message || 'Unknown network error sending WhatsApp message';
     console.error('[WhatsApp Network Exception]', errorString);
-    return {
-      success: false,
-      error: errorString,
-    };
+    return { success: false, error: errorString };
   }
 }
 

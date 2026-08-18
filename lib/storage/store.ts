@@ -1,8 +1,7 @@
 import { Task, ExtractedTask, WhatsAppLog, Settings } from '../types/database';
 import { calculateReminderDate, normalizeTimeString, normalizePhoneNumber } from '../date/calculator';
-import { supabaseAdmin } from '../supabase/admin';
 
-// In-Memory store as instant zero-config fallback
+// ─── In-Memory Store (zero-config fallback) ──────────────────────────────────
 let memoryTasks: Task[] = [];
 let memoryLogs: WhatsAppLog[] = [];
 let memorySettings: Settings = {
@@ -16,19 +15,33 @@ let memorySettings: Settings = {
   updated_at: new Date().toISOString(),
 };
 
+// ─── Lazy Supabase Client (only created when env vars are real) ───────────────
 function isSupabaseConfigured(): boolean {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
-  
-  if (!url || url.includes('placeholder') || url.includes('your-project') || !url.startsWith('https://')) {
-    return false;
-  }
-  if (!key || key.includes('placeholder') || key.includes('your-anon-key') || key.includes('your-service-role-key') || key.length < 20) {
-    return false;
-  }
+
+  if (!url || url.includes('placeholder') || url.includes('your-project') || !url.startsWith('https://')) return false;
+  if (!key || key.includes('placeholder') || key.includes('your-anon-key') || key.includes('your-service-role-key') || key.length < 20) return false;
   return true;
 }
 
+// Lazy singleton — only instantiated if Supabase is properly configured
+let _supabaseClient: any = null;
+function getSupabase() {
+  if (_supabaseClient) return _supabaseClient;
+  if (!isSupabaseConfigured()) return null;
+
+  // Dynamic import at runtime so module-level execution never triggers fetch
+  const { createClient } = require('@supabase/supabase-js');
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+  _supabaseClient = createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+  return _supabaseClient;
+}
+
+// ─── Tasks ────────────────────────────────────────────────────────────────────
 export async function getTasksFromStore(filters: {
   status?: string;
   search?: string;
@@ -37,62 +50,45 @@ export async function getTasksFromStore(filters: {
   limit?: number;
   offset?: number;
 } = {}): Promise<{ tasks: Task[]; total: number }> {
-  if (isSupabaseConfigured()) {
+  const db = getSupabase();
+  if (db) {
     try {
-      let query = supabaseAdmin
+      let query = db
         .from('tasks')
         .select('*, pdf_file:pdf_files(filename)', { count: 'exact' })
         .order('task_date', { ascending: true });
 
-      if (filters.status && filters.status !== 'all') {
-        query = query.eq('status', filters.status);
-      }
-      if (filters.search) {
-        query = query.ilike('task_name', `%${filters.search}%`);
-      }
-      if (filters.fromDate) {
-        query = query.gte('task_date', filters.fromDate);
-      }
-      if (filters.toDate) {
-        query = query.lte('task_date', filters.toDate);
-      }
+      if (filters.status && filters.status !== 'all') query = query.eq('status', filters.status);
+      if (filters.search) query = query.ilike('task_name', `%${filters.search}%`);
+      if (filters.fromDate) query = query.gte('task_date', filters.fromDate);
+      if (filters.toDate) query = query.lte('task_date', filters.toDate);
+
       const offset = filters.offset || 0;
       const limit = filters.limit || 100;
       query = query.range(offset, offset + limit - 1);
 
       const { data, error, count } = await query;
-      if (!error && data) {
-        return { tasks: data as Task[], total: count || data.length };
-      }
+      if (!error && data) return { tasks: data as Task[], total: count || data.length };
     } catch (e) {
-      console.warn('Supabase query notice:', e);
+      console.warn('[Store] Supabase query notice:', e);
     }
   }
 
-  // Fallback to Memory Store
+  // Memory fallback
   let result = [...memoryTasks];
-  if (filters.status && filters.status !== 'all') {
-    result = result.filter(t => t.status === filters.status);
-  }
+  if (filters.status && filters.status !== 'all') result = result.filter(t => t.status === filters.status);
   if (filters.search) {
     const s = filters.search.toLowerCase();
     result = result.filter(t => t.task_name.toLowerCase().includes(s));
   }
-  if (filters.fromDate) {
-    result = result.filter(t => t.task_date >= filters.fromDate!);
-  }
-  if (filters.toDate) {
-    result = result.filter(t => t.task_date <= filters.toDate!);
-  }
+  if (filters.fromDate) result = result.filter(t => t.task_date >= filters.fromDate!);
+  if (filters.toDate) result = result.filter(t => t.task_date <= filters.toDate!);
 
   result.sort((a, b) => a.task_date.localeCompare(b.task_date));
   const total = result.length;
   const offset = filters.offset || 0;
   const limit = filters.limit || 100;
-  return {
-    tasks: result.slice(offset, offset + limit),
-    total,
-  };
+  return { tasks: result.slice(offset, offset + limit), total };
 }
 
 export async function saveApprovedTasks(tasks: ExtractedTask[], pdfId?: string): Promise<{ count: number; tasks: Task[] }> {
@@ -116,25 +112,24 @@ export async function saveApprovedTasks(tasks: ExtractedTask[], pdfId?: string):
     };
   });
 
-  if (isSupabaseConfigured()) {
+  const db = getSupabase();
+  if (db) {
     try {
-      const { data, error } = await supabaseAdmin
+      const { data, error } = await db
         .from('tasks')
         .upsert(
-          preparedTasks.map(({ pdf_file, ...rest }) => rest),
+          preparedTasks.map(({ pdf_file, ...rest }: any) => rest),
           { onConflict: 'recipient_phone,task_date,task_name', ignoreDuplicates: false }
         )
         .select();
 
-      if (!error && data) {
-        return { count: data.length, tasks: data as Task[] };
-      }
+      if (!error && data) return { count: data.length, tasks: data as Task[] };
     } catch (e) {
-      console.warn('Supabase save notice:', e);
+      console.warn('[Store] Supabase save notice:', e);
     }
   }
 
-  // Memory store upsert
+  // Memory upsert
   for (const newTask of preparedTasks) {
     const existingIndex = memoryTasks.findIndex(
       t => t.recipient_phone === newTask.recipient_phone && t.task_date === newTask.task_date && t.task_name === newTask.task_name
@@ -149,45 +144,37 @@ export async function saveApprovedTasks(tasks: ExtractedTask[], pdfId?: string):
   return { count: preparedTasks.length, tasks: preparedTasks };
 }
 
-export async function updateTaskInStore(
-  taskId: string,
-  updates: Partial<Task>
-): Promise<Task | null> {
-  if (isSupabaseConfigured()) {
+export async function updateTaskInStore(taskId: string, updates: Partial<Task>): Promise<Task | null> {
+  const db = getSupabase();
+  if (db) {
     try {
-      const { data } = await supabaseAdmin
+      const { data } = await db
         .from('tasks')
-        .update({
-          ...updates,
-          updated_at: new Date().toISOString(),
-        })
+        .update({ ...updates, updated_at: new Date().toISOString() })
         .eq('id', taskId)
         .select()
         .single();
       if (data) return data as Task;
     } catch (e) {
-      console.warn('Supabase update notice:', e);
+      console.warn('[Store] Supabase update notice:', e);
     }
   }
 
   const taskIndex = memoryTasks.findIndex(t => t.id === taskId);
   if (taskIndex >= 0) {
-    memoryTasks[taskIndex] = {
-      ...memoryTasks[taskIndex],
-      ...updates,
-      updated_at: new Date().toISOString(),
-    };
+    memoryTasks[taskIndex] = { ...memoryTasks[taskIndex], ...updates, updated_at: new Date().toISOString() };
     return memoryTasks[taskIndex];
   }
   return null;
 }
 
 export async function deleteTaskFromStore(taskId: string): Promise<boolean> {
-  if (isSupabaseConfigured()) {
+  const db = getSupabase();
+  if (db) {
     try {
-      await supabaseAdmin.from('tasks').delete().eq('id', taskId);
+      await db.from('tasks').delete().eq('id', taskId);
     } catch (e) {
-      console.warn('Supabase delete notice:', e);
+      console.warn('[Store] Supabase delete notice:', e);
     }
   }
 
@@ -212,11 +199,12 @@ export async function logWhatsAppMessage(log: Omit<WhatsAppLog, 'id' | 'created_
     created_at: new Date().toISOString(),
   };
 
-  if (isSupabaseConfigured()) {
+  const db = getSupabase();
+  if (db) {
     try {
-      await supabaseAdmin.from('whatsapp_logs').insert([fullLog]);
+      await db.from('whatsapp_logs').insert([fullLog]);
     } catch (e) {
-      console.warn('Supabase log notice:', e);
+      console.warn('[Store] Supabase log notice:', e);
     }
   }
 
@@ -224,13 +212,15 @@ export async function logWhatsAppMessage(log: Omit<WhatsAppLog, 'id' | 'created_
   if (memoryLogs.length > 200) memoryLogs.pop();
 }
 
+// ─── Settings ─────────────────────────────────────────────────────────────────
 export async function getSettingsStore(): Promise<Settings> {
-  if (isSupabaseConfigured()) {
+  const db = getSupabase();
+  if (db) {
     try {
-      const { data } = await supabaseAdmin.from('settings').select().single();
+      const { data } = await db.from('settings').select().single();
       if (data) return data as Settings;
     } catch (e) {
-      console.warn('Supabase settings notice:', e);
+      console.warn('[Store] Supabase settings notice:', e);
     }
   }
   return memorySettings;
@@ -238,11 +228,12 @@ export async function getSettingsStore(): Promise<Settings> {
 
 export async function updateSettingsStore(newSettings: Partial<Settings>): Promise<Settings> {
   memorySettings = { ...memorySettings, ...newSettings, updated_at: new Date().toISOString() };
-  if (isSupabaseConfigured()) {
+  const db = getSupabase();
+  if (db) {
     try {
-      await supabaseAdmin.from('settings').upsert({ id: 'default-settings', ...memorySettings });
+      await db.from('settings').upsert({ id: 'default-settings', ...memorySettings });
     } catch (e) {
-      console.warn('Supabase update settings notice:', e);
+      console.warn('[Store] Supabase update settings notice:', e);
     }
   }
   return memorySettings;
