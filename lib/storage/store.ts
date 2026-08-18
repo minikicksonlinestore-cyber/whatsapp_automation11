@@ -31,7 +31,6 @@ function getSupabase() {
   if (_supabaseClient) return _supabaseClient;
   if (!isSupabaseConfigured()) return null;
 
-  // Dynamic import at runtime so module-level execution never triggers fetch
   const { createClient } = require('@supabase/supabase-js');
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
@@ -69,6 +68,7 @@ export async function getTasksFromStore(filters: {
 
       const { data, error, count } = await query;
       if (!error && data) return { tasks: data as Task[], total: count || data.length };
+      if (error) console.error('[Store] Supabase getTasks error:', error.message, error.details);
     } catch (e) {
       console.warn('[Store] Supabase query notice:', e);
     }
@@ -124,6 +124,7 @@ export async function saveApprovedTasks(tasks: ExtractedTask[], pdfId?: string):
         .select();
 
       if (!error && data) return { count: data.length, tasks: data as Task[] };
+      if (error) console.error('[Store] Supabase saveTasks error:', error.message, error.details);
     } catch (e) {
       console.warn('[Store] Supabase save notice:', e);
     }
@@ -148,13 +149,14 @@ export async function updateTaskInStore(taskId: string, updates: Partial<Task>):
   const db = getSupabase();
   if (db) {
     try {
-      const { data } = await db
+      const { data, error } = await db
         .from('tasks')
         .update({ ...updates, updated_at: new Date().toISOString() })
         .eq('id', taskId)
         .select()
-        .single();
+        .maybeSingle();
       if (data) return data as Task;
+      if (error) console.error('[Store] Supabase updateTask error:', error.message, error.details);
     } catch (e) {
       console.warn('[Store] Supabase update notice:', e);
     }
@@ -172,7 +174,8 @@ export async function deleteTaskFromStore(taskId: string): Promise<boolean> {
   const db = getSupabase();
   if (db) {
     try {
-      await db.from('tasks').delete().eq('id', taskId);
+      const { error } = await db.from('tasks').delete().eq('id', taskId);
+      if (error) console.error('[Store] Supabase deleteTask error:', error.message, error.details);
     } catch (e) {
       console.warn('[Store] Supabase delete notice:', e);
     }
@@ -202,7 +205,8 @@ export async function logWhatsAppMessage(log: Omit<WhatsAppLog, 'id' | 'created_
   const db = getSupabase();
   if (db) {
     try {
-      await db.from('whatsapp_logs').insert([fullLog]);
+      const { error } = await db.from('whatsapp_logs').insert([fullLog]);
+      if (error) console.error('[Store] Supabase logMessage error:', error.message, error.details);
     } catch (e) {
       console.warn('[Store] Supabase log notice:', e);
     }
@@ -217,8 +221,13 @@ export async function getSettingsStore(): Promise<Settings> {
   const db = getSupabase();
   if (db) {
     try {
-      const { data } = await db.from('settings').select().single();
+      const { data, error } = await db
+        .from('settings')
+        .select()
+        .eq('id', 'default-settings')
+        .maybeSingle();
       if (data) return data as Settings;
+      if (error) console.error('[Store] Supabase getSettings error:', error.message, error.details);
     } catch (e) {
       console.warn('[Store] Supabase settings notice:', e);
     }
@@ -231,7 +240,8 @@ export async function updateSettingsStore(newSettings: Partial<Settings>): Promi
   const db = getSupabase();
   if (db) {
     try {
-      await db.from('settings').upsert({ id: 'default-settings', ...memorySettings });
+      const { error } = await db.from('settings').upsert(memorySettings);
+      if (error) console.error('[Store] Supabase updateSettings error:', error.message, error.details);
     } catch (e) {
       console.warn('[Store] Supabase update settings notice:', e);
     }
