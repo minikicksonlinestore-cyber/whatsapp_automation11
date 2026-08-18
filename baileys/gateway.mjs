@@ -1,21 +1,17 @@
 /**
  * Baileys WhatsApp Gateway
  * ─────────────────────────
- * Run this as a long-lived process:
+ * Run as a persistent long-lived process:
  *   node baileys/gateway.mjs
  *
- * It:
- *  1. Connects to WhatsApp (normal account — NOT Business API)
- *  2. Shows a QR code in terminal on first run; session is saved to
- *     ./baileys/session/ so you only scan once.
- *  3. Exposes a tiny HTTP server on port 3001 (configurable via PORT env var)
- *     so Next.js API routes can send commands to it.
+ * Connects to WhatsApp using a normal account (NOT Business API).
+ * Session saved to ./baileys/session/ — scan QR only once.
  *
- * Endpoints:
- *   GET  /status          → { connected: true|false, phone: "..." }
- *   GET  /groups          → [ { id, name, participants }, ... ]
- *   POST /send-group      → body: { groupId, message } → { success, messageId }
- *   POST /send-individual → body: { phone, message }  → { success, messageId }
+ * HTTP endpoints (port 3001 by default):
+ *   GET  /status          → { connected, phone, hasQR }
+ *   GET  /groups          → { groups: [{id,name,participants}], total }
+ *   POST /send-group      → { groupId, message } → { success, messageId }
+ *   POST /send-individual → { phone, message }   → { success, messageId }
  */
 
 import { createRequire } from 'module';
@@ -28,13 +24,13 @@ import fs from 'fs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// ── Dynamic imports for Baileys (CommonJS package) ────────────────────────────
+// ── Baileys (CommonJS) ────────────────────────────────────────────────────────
 const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  makeInMemoryStore,
+  isJidGroup,
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
@@ -46,10 +42,7 @@ const GATEWAY_SECRET = process.env.BAILEYS_GATEWAY_SECRET || 'baileys-local-secr
 
 if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
 
-// ── In-memory store (keeps chats / messages in RAM) ──────────────────────────
-const store = makeInMemoryStore({ logger: pino({ level: 'silent' }) });
-
-// ── Global state ──────────────────────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────────────────
 let sock = null;
 let isConnected = false;
 let currentPhone = null;
@@ -65,16 +58,13 @@ async function startBaileys() {
   sock = makeWASocket({
     version,
     auth: state,
-    logger: pino({ level: 'silent' }),   // set 'debug' for verbose logs
-    printQRInTerminal: true,              // also prints in terminal for easy scanning
+    logger: pino({ level: 'silent' }),
+    printQRInTerminal: true,
     browser: ['WhatsApp Reminder Bot', 'Chrome', '1.0.0'],
     connectTimeoutMs: 60000,
     keepAliveIntervalMs: 10000,
   });
 
-  store.bind(sock.ev);
-
-  // Save credentials whenever they update
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
@@ -82,17 +72,17 @@ async function startBaileys() {
 
     if (qr) {
       latestQR = qr;
-      console.log('\n[Baileys] ──────────────────────────────────────────');
-      console.log('[Baileys] Scan the QR code above with your WhatsApp.');
-      console.log('[Baileys] (Settings → Linked Devices → Link a Device)');
-      console.log('[Baileys] ──────────────────────────────────────────\n');
+      console.log('\n[Baileys] ─────────────────────────────────────────────────');
+      console.log('[Baileys] Scan the QR code above with WhatsApp:');
+      console.log('[Baileys] Settings → Linked Devices → Link a Device');
+      console.log('[Baileys] ─────────────────────────────────────────────────\n');
     }
 
     if (connection === 'open') {
       isConnected = true;
       latestQR = null;
       currentPhone = sock.user?.id?.split(':')[0] || 'Unknown';
-      console.log(`[Baileys] ✅ Connected as ${currentPhone}`);
+      console.log(`\n[Baileys] ✅ Connected as ${currentPhone}`);
     }
 
     if (connection === 'close') {
@@ -101,18 +91,26 @@ async function startBaileys() {
         ? lastDisconnect.error.output?.statusCode
         : null;
       const shouldReconnect = code !== DisconnectReason.loggedOut;
-
       console.log(`[Baileys] Connection closed (code=${code}). Reconnect: ${shouldReconnect}`);
-      if (shouldReconnect) {
-        setTimeout(startBaileys, 5000);
-      } else {
-        console.log('[Baileys] Logged out. Delete ./baileys/session/ and restart to re-link.');
-      }
+      if (shouldReconnect) setTimeout(startBaileys, 5000);
+      else console.log('[Baileys] Logged out. Delete ./baileys/session/ and restart.');
     }
   });
 }
 
-// ── HTTP Gateway Server ───────────────────────────────────────────────────────
+// ── Group listing ─────────────────────────────────────────────────────────────
+async function getGroups() {
+  if (!sock) throw new Error('Socket not initialized');
+  // groupFetchAllParticipating works on v6+ and v7-rc
+  const all = await sock.groupFetchAllParticipating();
+  return Object.values(all).map(g => ({
+    id: g.id,
+    name: g.subject || g.id,
+    participants: g.participants?.length || 0,
+  })).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// ── HTTP helpers ──────────────────────────────────────────────────────────────
 function parseBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -130,73 +128,45 @@ function json(res, statusCode, data) {
 }
 
 function checkAuth(req, res) {
-  const auth = req.headers['x-gateway-secret'];
-  if (auth !== GATEWAY_SECRET) {
-    json(res, 401, { error: 'Unauthorized: invalid x-gateway-secret header' });
+  if (req.headers['x-gateway-secret'] !== GATEWAY_SECRET) {
+    json(res, 401, { error: 'Unauthorized' });
     return false;
   }
   return true;
 }
 
+// ── HTTP Server ───────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
-  // ─ GET /status ─────────────────────────────────────────────────────────────
+  // GET /status
   if (req.method === 'GET' && url.pathname === '/status') {
-    return json(res, 200, {
-      connected: isConnected,
-      phone: currentPhone,
-      hasQR: !!latestQR,
-    });
+    return json(res, 200, { connected: isConnected, phone: currentPhone, hasQR: !!latestQR });
   }
 
-  // ─ GET /qr ─────────────────────────────────────────────────────────────────
+  // GET /qr
   if (req.method === 'GET' && url.pathname === '/qr') {
     if (!checkAuth(req, res)) return;
-    if (!latestQR) return json(res, 200, { qr: null, message: 'No QR pending — already connected or not yet generated.' });
-    return json(res, 200, { qr: latestQR });
+    return json(res, 200, { qr: latestQR || null });
   }
 
-  // ─ GET /groups ──────────────────────────────────────────────────────────────
+  // GET /groups
   if (req.method === 'GET' && url.pathname === '/groups') {
     if (!checkAuth(req, res)) return;
     if (!isConnected) return json(res, 503, { error: 'Not connected to WhatsApp yet.' });
-
     try {
-      const allChats = await store.chats.all();
-      // Filter for group chats (IDs end in @g.us)
-      const groups = allChats
-        .filter(c => c.id?.endsWith('@g.us'))
-        .map(c => ({
-          id: c.id,
-          name: c.name || c.id,
-        }))
-        .sort((a, b) => a.name.localeCompare(b.name));
-
-      // If store is empty (first run), fetch from WhatsApp directly
-      if (groups.length === 0) {
-        console.log('[Baileys] Store empty — fetching groups via groupFetchAllParticipating...');
-        const wGroups = await sock.groupFetchAllParticipating();
-        const fetched = Object.values(wGroups).map(g => ({
-          id: g.id,
-          name: g.subject || g.id,
-          participants: g.participants?.length || 0,
-        })).sort((a, b) => a.name.localeCompare(b.name));
-        return json(res, 200, { groups: fetched, total: fetched.length });
-      }
-
+      const groups = await getGroups();
       return json(res, 200, { groups, total: groups.length });
     } catch (err) {
-      console.error('[Baileys] /groups error:', err);
+      console.error('[Baileys] /groups error:', err.message);
       return json(res, 500, { error: err.message });
     }
   }
 
-  // ─ POST /send-group ─────────────────────────────────────────────────────────
+  // POST /send-group
   if (req.method === 'POST' && url.pathname === '/send-group') {
     if (!checkAuth(req, res)) return;
     if (!isConnected) return json(res, 503, { error: 'Not connected to WhatsApp yet.' });
-
     try {
       const body = await parseBody(req);
       const { groupId, message } = body;
@@ -205,66 +175,55 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: '"groupId" and "message" are required.' });
       }
       if (!groupId.endsWith('@g.us')) {
-        return json(res, 400, { error: 'Invalid groupId — must end with @g.us' });
+        return json(res, 400, { error: `Invalid groupId "${groupId}" — must end with @g.us` });
       }
 
-      console.log(`[Baileys] Sending to group ${groupId}:\n${message}`);
-
+      console.log(`[Baileys] → Sending to group ${groupId}:\n${message}\n`);
       const sent = await sock.sendMessage(groupId, { text: message });
       const messageId = sent?.key?.id;
-
-      if (!messageId) {
-        throw new Error('Message sent but no message ID returned');
-      }
+      if (!messageId) throw new Error('No message ID returned from WhatsApp');
 
       console.log(`[Baileys] ✅ Group message sent: ${messageId}`);
       return json(res, 200, { success: true, messageId });
     } catch (err) {
       console.error('[Baileys] /send-group error:', err.message);
-      return json(res, 500, { error: err.message || 'Failed to send group message' });
+      return json(res, 500, { error: err.message });
     }
   }
 
-  // ─ POST /send-individual ────────────────────────────────────────────────────
+  // POST /send-individual
   if (req.method === 'POST' && url.pathname === '/send-individual') {
     if (!checkAuth(req, res)) return;
     if (!isConnected) return json(res, 503, { error: 'Not connected to WhatsApp yet.' });
-
     try {
       const body = await parseBody(req);
       let { phone, message } = body;
 
-      if (!phone || !message) {
-        return json(res, 400, { error: '"phone" and "message" are required.' });
-      }
+      if (!phone || !message) return json(res, 400, { error: '"phone" and "message" are required.' });
 
-      // Normalise phone: strip non-digits, ensure no leading +
       phone = phone.replace(/\D/g, '');
       const jid = `${phone}@s.whatsapp.net`;
 
-      console.log(`[Baileys] Sending individual to ${jid}`);
-
+      console.log(`[Baileys] → Sending individual to ${jid}`);
       const sent = await sock.sendMessage(jid, { text: message });
       const messageId = sent?.key?.id;
-
       console.log(`[Baileys] ✅ Individual message sent: ${messageId}`);
       return json(res, 200, { success: true, messageId });
     } catch (err) {
       console.error('[Baileys] /send-individual error:', err.message);
-      return json(res, 500, { error: err.message || 'Failed to send message' });
+      return json(res, 500, { error: err.message });
     }
   }
 
-  // ─ 404 ─────────────────────────────────────────────────────────────────────
   json(res, 404, { error: `Unknown route: ${req.method} ${url.pathname}` });
 });
 
 server.listen(PORT, () => {
-  console.log(`[Baileys Gateway] HTTP server listening on http://localhost:${PORT}`);
-  console.log(`[Baileys Gateway] Secret: ${GATEWAY_SECRET}`);
+  console.log(`\n[Baileys Gateway] HTTP server ready → http://localhost:${PORT}`);
+  console.log(`[Baileys Gateway] Secret header: x-gateway-secret: ${GATEWAY_SECRET}\n`);
 });
 
 startBaileys().catch(err => {
-  console.error('[Baileys] Fatal error during startup:', err);
+  console.error('[Baileys] Fatal startup error:', err);
   process.exit(1);
 });
