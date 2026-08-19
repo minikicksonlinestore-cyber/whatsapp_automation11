@@ -56,6 +56,7 @@ export interface Settings {
   timezone: string;
   whatsapp_template_name: string;
   message_template: string;
+  whatsapp_group_id?: string | null;
   updated_at: string;
 }
 

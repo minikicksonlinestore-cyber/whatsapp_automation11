@@ -1,48 +1,77 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { sendTestWhatsAppMessage } from '@/lib/whatsapp';
-import { supabaseAdmin } from '@/lib/supabase/admin';
+import { sendWhatsAppGroupMessage, formatGroupDateLabel, buildGroupMessage } from '@/lib/sendWhatsAppGroupMessage';
+import { getSettingsStore, logWhatsAppMessage } from '@/lib/storage/store';
+import { WHATSAPP_GROUPS } from '@/lib/whatsapp-groups';
 
+export const dynamic = 'force-dynamic';
+
+/**
+ * POST /api/whatsapp/test
+ * Sends a test message to the currently configured group via Baileys gateway.
+ */
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(() => ({}));
-    const recipient = body.recipient_phone || '+917025219962';
-    const templateName = body.template_name;
 
-    const result = await sendTestWhatsAppMessage(recipient, templateName);
+    // Resolve group ID: body → saved settings → first group in list
+    let groupId = body.group_id || '';
+    if (!groupId) {
+      const settings = await getSettingsStore();
+      groupId = settings.whatsapp_group_id || '';
+    }
+    if (!groupId && WHATSAPP_GROUPS.length > 0) {
+      groupId = WHATSAPP_GROUPS[0].id;
+    }
 
-    // Record test in whatsapp_logs
+    const groupName = WHATSAPP_GROUPS.find(g => g.id === groupId)?.name || groupId;
+
+    // Build a test message for tomorrow
+    const tomorrow = new Date(Date.now() + 86400000).toISOString().split('T')[0];
+    const dateLabel = formatGroupDateLabel(tomorrow);
+    const message = buildGroupMessage(dateLabel, [
+      { client: 'Test Client', task: 'System Test Message ✓' },
+    ]);
+
+    console.log(`[WA Test] Sending test to group "${groupName}" (${groupId})`);
+
+    const result = await sendWhatsAppGroupMessage({ groupId, message });
+
+    // Log the attempt
     try {
-      await supabaseAdmin.from('whatsapp_logs').insert({
-        recipient_phone: recipient,
-        message_type: 'test_template',
+      await logWhatsAppMessage({
+        task_id: null,
+        recipient_phone: groupId,
+        message_type: 'test_group',
         whatsapp_message_id: result.messageId || null,
         status: result.success ? 'success' : 'failed',
-        response: result.rawResponse || null,
         error: result.error || null,
-      });
+      } as any);
     } catch (logErr) {
-      console.warn('Could not record test in whatsapp_logs:', logErr);
+      console.warn('[WA Test] Log write failed:', logErr);
     }
 
     if (result.success) {
       return NextResponse.json({
         success: true,
         messageId: result.messageId,
-        recipient,
-        details: 'Test WhatsApp message sent successfully via Meta Cloud API.',
-        metaResponse: result.rawResponse,
+        groupId,
+        groupName,
+        message,
+        details: `Test message sent to "${groupName}" via Baileys gateway.`,
       });
     } else {
       return NextResponse.json(
         {
           success: false,
           error: result.error,
-          metaResponse: result.rawResponse,
+          groupId,
+          groupName,
         },
         { status: 400 }
       );
     }
   } catch (err: any) {
+    console.error('[WA Test] Error:', err);
     return NextResponse.json({ error: err.message || 'Internal server error' }, { status: 500 });
   }
 }

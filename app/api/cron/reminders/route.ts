@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getTasksFromStore, updateTaskStatus, logWhatsAppMessage } from '@/lib/storage/store';
-import { sendBaileysGroupReminder, sendBaileysIndividual, formatGroupDateLabel, buildGroupMessageText, getBaileysStatus } from '@/lib/whatsapp-baileys';
+import {
+  sendWhatsAppGroupMessage,
+  formatGroupDateLabel,
+  buildGroupMessage,
+} from '@/lib/sendWhatsAppGroupMessage';
+import { getSettingsStore } from '@/lib/storage/store';
 import { getNowInTimezone } from '@/lib/date/calculator';
 import { env } from '@/lib/validation/env';
 
@@ -8,6 +13,7 @@ export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
 export async function GET(req: NextRequest) {
+  // ── Auth ───────────────────────────────────────────────────────────────────
   const authHeader = req.headers.get('authorization');
   const cronSecretQuery = req.nextUrl.searchParams.get('secret');
 
@@ -15,31 +21,33 @@ export async function GET(req: NextRequest) {
     const isAuthorizedHeader = authHeader === `Bearer ${env.CRON_SECRET}`;
     const isAuthorizedQuery = cronSecretQuery === env.CRON_SECRET;
     if (!isAuthorizedHeader && !isAuthorizedQuery) {
-      return NextResponse.json({ error: 'Unauthorized: Invalid or missing CRON_SECRET authorization.' }, { status: 401 });
+      return NextResponse.json(
+        { error: 'Unauthorized: Invalid or missing CRON_SECRET.' },
+        { status: 401 }
+      );
     }
   }
 
   try {
-    const timezone = process.env.TIMEZONE || 'Asia/Kolkata';
+    // ── 1. Load settings ─────────────────────────────────────────────────────
+    const settings = await getSettingsStore();
+    const timezone = settings.timezone || process.env.TIMEZONE || 'Asia/Kolkata';
     const { currentDate, currentTime, formattedDisplay } = getNowInTimezone(timezone);
 
-    console.log(`[Cron Reminders] Executing at ${formattedDisplay} (${timezone})`);
+    console.log(`[Cron Reminders] Running at ${formattedDisplay} (${timezone})`);
 
-    // ── 1. Check Baileys gateway status ─────────────────────────────────────
-    const gatewayStatus = await getBaileysStatus();
-    if (!gatewayStatus.connected) {
-      const msg = `Baileys gateway not connected. ${gatewayStatus.error || 'Start: node baileys/gateway.mjs'}`;
+    // ── 2. Load saved group ID from settings ─────────────────────────────────
+    const groupId = settings.whatsapp_group_id || process.env.WHATSAPP_GROUP_ID || '';
+    if (!groupId) {
+      const msg = 'No WhatsApp group configured. Set WHATSAPP_GROUP_ID in env or select a group in Settings.';
       console.error('[Cron Reminders]', msg);
-      return NextResponse.json({ error: msg, evaluatedAt: formattedDisplay }, { status: 503 });
+      return NextResponse.json({ error: msg, evaluatedAt: formattedDisplay }, { status: 400 });
     }
 
-    console.log(`[Cron Reminders] Gateway connected as ${gatewayStatus.phone}`);
-
-    // ── 2. Fetch pending tasks due now ───────────────────────────────────────
+    // ── 3. Find pending tasks due now ────────────────────────────────────────
     const { tasks: allPending } = await getTasksFromStore({ status: 'pending' });
-
-    const dueTasks = allPending.filter(t =>
-      t.reminder_date <= currentDate && t.reminder_time <= currentTime
+    const dueTasks = allPending.filter(
+      t => t.reminder_date <= currentDate && t.reminder_time <= currentTime
     );
 
     if (dueTasks.length === 0) {
@@ -55,50 +63,51 @@ export async function GET(req: NextRequest) {
 
     console.log(`[Cron Reminders] Found ${dueTasks.length} task(s) due.`);
 
-    // ── 3. Group tasks by reminder_date ──────────────────────────────────────
-    //  Format: { "2026-08-19": [ task, task, ... ] }
+    // ── 4. Group tasks by task_date ──────────────────────────────────────────
     const byDate: Record<string, typeof dueTasks> = {};
     for (const task of dueTasks) {
-      const key = task.reminder_date || task.task_date;
+      const key = task.task_date;
       if (!byDate[key]) byDate[key] = [];
       byDate[key].push(task);
     }
 
-    // ── 4. Resolve group ID ──────────────────────────────────────────────────
-    const groupId = process.env.WHATSAPP_GROUP_ID || '';
-
     const results: any[] = [];
 
-    // ── 5. Send grouped messages, one per date ───────────────────────────────
+    // ── 5. Send one grouped message per date ─────────────────────────────────
     for (const [taskDate, tasks] of Object.entries(byDate)) {
       const dateLabel = formatGroupDateLabel(taskDate);
 
-      // Build items from task_name — expected format: "ClientName – TaskName"
-      // If task_name has " – " separator use it; otherwise use task_name as-is
+      // Parse task_name: if it contains " – " treat left as client, right as task
+      // Otherwise use task_name as-is in the task column
       const items = tasks.map(t => {
-        const sep = t.task_name.includes(' – ') ? ' – ' : (t.task_name.includes(' - ') ? ' - ' : null);
+        const sep = t.task_name.includes(' – ')
+          ? ' – '
+          : t.task_name.includes(' - ')
+          ? ' - '
+          : null;
         if (sep) {
-          const [client, ...rest] = t.task_name.split(sep);
-          return { client: client.trim(), task: rest.join(sep).trim() };
+          const idx = t.task_name.indexOf(sep);
+          return {
+            client: t.task_name.substring(0, idx).trim(),
+            task: t.task_name.substring(idx + sep.length).trim(),
+          };
         }
-        return { client: 'Task', task: t.task_name.trim() };
+        return { client: '', task: t.task_name.trim() };
       });
 
-      let sendResult: { success: boolean; messageId?: string; error?: string };
+      // Filter out items with no client (use task name directly)
+      const messageItems = items.map(i =>
+        i.client ? i : { client: 'Reminder', task: i.task }
+      );
 
-      if (groupId) {
-        // ── Send to group ────────────────────────────────────────────────────
-        console.log(`[Cron Reminders] Sending group message for ${dateLabel} → ${groupId}`);
-        sendResult = await sendBaileysGroupReminder({ groupId, dateLabel, items });
-      } else {
-        // ── Fallback: send individual messages to each task's recipient ──────
-        console.warn('[Cron Reminders] WHATSAPP_GROUP_ID not set — falling back to individual messages.');
-        const message = buildGroupMessageText(dateLabel, items);
-        const recipient = tasks[0]?.recipient_phone || '+917025219962';
-        sendResult = await sendBaileysIndividual({ phone: recipient, message });
-      }
+      const message = buildGroupMessage(dateLabel, messageItems);
 
-      // ── 6. Update all tasks in this date group ───────────────────────────
+      console.log(`[Cron Reminders] Sending group message for ${dateLabel} → ${groupId}`);
+
+      // ── Use shared sender (same as "Send Now") ────────────────────────────
+      const sendResult = await sendWhatsAppGroupMessage({ groupId, message });
+
+      // ── Update status for every task in this date group ───────────────────
       for (const task of tasks) {
         if (sendResult.success) {
           await updateTaskStatus(task.id, 'sent', {
@@ -107,18 +116,23 @@ export async function GET(req: NextRequest) {
           });
         } else {
           await updateTaskStatus(task.id, 'failed', {
-            error_message: sendResult.error || 'Send failed',
+            error_message: sendResult.error || 'Group send failed',
           });
         }
 
-        await logWhatsAppMessage({
-          task_id: task.id,
-          recipient_phone: groupId || task.recipient_phone,
-          message_type: groupId ? 'group' : 'individual',
-          whatsapp_message_id: sendResult.messageId || null,
-          status: sendResult.success ? 'success' : 'failed',
-          error: sendResult.error || null,
-        } as any);
+        // Log every attempt
+        try {
+          await logWhatsAppMessage({
+            task_id: task.id,
+            recipient_phone: groupId,
+            message_type: 'group',
+            whatsapp_message_id: sendResult.messageId || null,
+            status: sendResult.success ? 'success' : 'failed',
+            error: sendResult.error || null,
+          } as any);
+        } catch (logErr) {
+          console.warn('[Cron Reminders] Log write failed:', logErr);
+        }
 
         results.push({
           taskId: task.id,
@@ -126,9 +140,16 @@ export async function GET(req: NextRequest) {
           taskDate: task.task_date,
           dateLabel,
           status: sendResult.success ? 'sent' : 'failed',
-          messageId: sendResult.messageId,
-          error: sendResult.error,
+          messageId: sendResult.messageId || null,
+          error: sendResult.error || null,
         });
+      }
+
+      // Log per-date result
+      if (sendResult.success) {
+        console.log(`[Cron Reminders] ✅ ${dateLabel} → messageId=${sendResult.messageId}`);
+      } else {
+        console.error(`[Cron Reminders] ❌ ${dateLabel} → error=${sendResult.error}`);
       }
     }
 
@@ -137,10 +158,10 @@ export async function GET(req: NextRequest) {
       evaluatedAt: formattedDisplay,
       currentDate,
       currentTime,
+      groupId,
       processedCount: results.length,
       sentCount: results.filter(r => r.status === 'sent').length,
       failedCount: results.filter(r => r.status === 'failed').length,
-      groupId: groupId || null,
       results,
     });
   } catch (err: any) {

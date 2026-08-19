@@ -12,6 +12,7 @@ let memorySettings: Settings = {
   timezone: 'Asia/Kolkata',
   whatsapp_template_name: 'task_reminder',
   message_template: '🔔 *Task Reminder*\n\nTomorrow ({{1}}) you have:\n📌 *{{2}}*\n\nPlease complete the task on time.',
+  whatsapp_group_id: process.env.WHATSAPP_GROUP_ID || null,
   updated_at: new Date().toISOString(),
 };
 
