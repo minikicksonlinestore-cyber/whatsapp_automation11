@@ -270,6 +270,10 @@ function isNoiseLine(line: string): boolean {
     return true;
   }
 
+  if (/^-+\s*\d+\s+of\s+\d+\s*-+$/i.test(lower)) {
+    return true;
+  }
+
   return false;
 }
 
@@ -681,9 +685,8 @@ export function parseCalendarText(
           item.clientName
       )?.clientName;
 
-    for (const day of currentActiveDays) {
-      addTask(day, combinedText, finalMonth, finalYear, lineClient);
-    }
+    const targetDay = currentActiveDays[currentActiveDays.length - 1];
+    addTask(targetDay, combinedText, finalMonth, finalYear, lineClient);
 
     pendingTaskLines = [];
   };
@@ -696,8 +699,9 @@ export function parseCalendarText(
     const line =
       lines[i];
 
-    // Explicit client heading
+    // Explicit client heading (only before we enter the calendar grid)
     if (
+      currentActiveDays.length === 0 &&
       looksLikeClientHeader(
         line
       )
@@ -738,7 +742,7 @@ export function parseCalendarText(
     // Day number series
     const numberSeriesMatch =
       line.match(
-        /^(\d{1,2}(?:\s+\d{1,2})*)$/
+        /^(\d{1,2}\.?(?:\s+\d{1,2}\.?)*)$/
       );
 
     if (
