@@ -1,69 +1,92 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { supabaseAdmin } from '@/lib/supabase/admin';
-import { sendWhatsAppReminder } from '@/lib/whatsapp';
-import { formatReadableDate } from '@/lib/date/calculator';
+import { getTasksFromStore, updateTaskStatus, logWhatsAppMessage } from '@/lib/storage/store';
+import { getSettingsStore } from '@/lib/storage/store';
+import { sendWhatsAppGroupMessage, formatGroupDateLabel, buildGroupMessage } from '@/lib/sendWhatsAppGroupMessage';
+
+export const dynamic = 'force-dynamic';
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(() => ({}));
     const { taskIds } = body as { taskIds?: string[] };
 
-    let query = supabaseAdmin.from('tasks').select('*').eq('status', 'failed');
+    // Use unified store (same as task list) to find failed tasks
+    const { tasks: allTasks } = await getTasksFromStore({ status: 'failed', limit: 200 });
 
-    if (taskIds && taskIds.length > 0) {
-      query = query.in('id', taskIds);
+    const failedTasks = taskIds && taskIds.length > 0
+      ? allTasks.filter(t => taskIds.includes(t.id))
+      : allTasks;
+
+    if (failedTasks.length === 0) {
+      return NextResponse.json({ totalRetried: 0, successCount: 0, failedCount: 0, results: [] });
     }
 
-    const { data: failedTasks, error } = await query;
+    // Load group ID from settings
+    const settings = await getSettingsStore();
+    const groupId = settings.whatsapp_group_id || process.env.WHATSAPP_GROUP_ID || '';
 
-    if (error || !failedTasks) {
-      return NextResponse.json({ error: error?.message || 'Failed to query failed tasks' }, { status: 500 });
+    if (!groupId) {
+      return NextResponse.json({
+        error: 'No WhatsApp group configured. Go to Settings and select a group.',
+      }, { status: 400 });
     }
 
     const results = [];
 
     for (const task of failedTasks) {
-      const taskDateFormatted = formatReadableDate(task.task_date);
-      const sendResult = await sendWhatsAppReminder({
-        to: task.recipient_phone,
-        taskDateFormatted,
-        taskName: task.task_name,
-      });
+      const dateLabel = formatGroupDateLabel(task.task_date);
 
-      await supabaseAdmin.from('whatsapp_logs').insert({
-        task_id: task.id,
-        recipient_phone: task.recipient_phone,
-        message_type: 'template',
-        whatsapp_message_id: sendResult.messageId || null,
-        status: sendResult.success ? 'success' : 'failed',
-        response: sendResult.rawResponse || null,
-        error: sendResult.error || null,
-      });
+      const sep = task.task_name.includes(' – ')
+        ? ' – '
+        : task.task_name.includes(' - ')
+        ? ' - '
+        : null;
+
+      let items: Array<{ client: string; task: string }>;
+      if (sep) {
+        const idx = task.task_name.indexOf(sep);
+        items = [{
+          client: task.task_name.substring(0, idx).trim(),
+          task: task.task_name.substring(idx + sep.length).trim(),
+        }];
+      } else {
+        items = [{ client: 'Reminder', task: task.task_name.trim() }];
+      }
+
+      const message = buildGroupMessage(dateLabel, items);
+      const sendResult = await sendWhatsAppGroupMessage({ groupId, message });
 
       if (sendResult.success) {
-        await supabaseAdmin
-          .from('tasks')
-          .update({
-            status: 'sent',
-            whatsapp_message_id: sendResult.messageId,
-            sent_at: new Date().toISOString(),
-            error_message: null,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', task.id);
-
-        results.push({ id: task.id, success: true, messageId: sendResult.messageId });
+        await updateTaskStatus(task.id, 'sent', {
+          whatsapp_message_id: sendResult.messageId,
+          sent_at: new Date().toISOString(),
+        });
       } else {
-        await supabaseAdmin
-          .from('tasks')
-          .update({
-            error_message: sendResult.error,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', task.id);
-
-        results.push({ id: task.id, success: false, error: sendResult.error });
+        await updateTaskStatus(task.id, 'failed', {
+          error_message: sendResult.error || 'Retry send failed',
+        });
       }
+
+      try {
+        await logWhatsAppMessage({
+          task_id: task.id,
+          recipient_phone: groupId,
+          message_type: 'group_retry',
+          whatsapp_message_id: sendResult.messageId || null,
+          status: sendResult.success ? 'success' : 'failed',
+          error: sendResult.error || null,
+        } as any);
+      } catch (logErr) {
+        console.warn('[Retry] Log write failed:', logErr);
+      }
+
+      results.push({
+        id: task.id,
+        taskName: task.task_name,
+        success: sendResult.success,
+        messageId: sendResult.messageId || null,
+        error: sendResult.error || null,
+      });
     }
 
     return NextResponse.json({
@@ -73,6 +96,7 @@ export async function POST(req: NextRequest) {
       results,
     });
   } catch (err: any) {
+    console.error('[Retry] Error:', err);
     return NextResponse.json({ error: err.message || 'Internal server error' }, { status: 500 });
   }
 }

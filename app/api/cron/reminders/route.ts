@@ -45,10 +45,28 @@ export async function GET(req: NextRequest) {
     }
 
     // ── 3. Find pending tasks due now ────────────────────────────────────────
-    const { tasks: allPending } = await getTasksFromStore({ status: 'pending' });
-    const dueTasks = allPending.filter(
-      t => t.reminder_date <= currentDate && t.reminder_time <= currentTime
-    );
+    const { tasks: allPending } = await getTasksFromStore({ status: 'pending', limit: 1000 });
+    
+    // Parse time to minutes-since-midnight for robust comparison
+    const timeToMinutes = (tStr: string): number => {
+      const [h, m] = tStr.split(':').map(Number);
+      return (h || 0) * 60 + (m || 0);
+    };
+    
+    const currentMinutes = timeToMinutes(currentTime);
+    const graceBufferMinutes = 15; // Allow tasks scheduled up to 15 minutes in the future to trigger
+    
+    const dueTasks = allPending.filter(t => {
+      if (!t.reminder_date) return false;
+      if (t.reminder_date < currentDate) {
+        return true; // Missed from past days
+      }
+      if (t.reminder_date === currentDate) {
+        const taskMinutes = timeToMinutes(t.reminder_time || '18:00:00');
+        return taskMinutes <= currentMinutes + graceBufferMinutes;
+      }
+      return false;
+    });
 
     if (dueTasks.length === 0) {
       return NextResponse.json({
